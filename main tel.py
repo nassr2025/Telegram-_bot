@@ -4,14 +4,17 @@ telegram_watcher.py
 
 مراقب رسائل تيليجرام متعدد الجلسات باستخدام Telethon.
 - يدعم تشغيل حتى 10 جلسات (أو أكثر) بالتوازي.
-- يعتمد قاعدة بيانات SQLite واحدة مشتركة بين كل الجلسات.
-- كل ثريد (جلسة) يستخدم اتصال مستقل للقاعدة لتفادي مشكلة "Recursive use of cursors not allowed".
-- يحذف قاعدة البيانات تلقائيًا إذا تجاوز عمرها 24 ساعة (يُعاد إنشاؤها آليًا).
-- فلترة ذكية: طول الرسالة، عدد الأسطر، تجاهل المشرفين، كلمات مفتاحية، تكرار عالمي/لكل مستخدم مع استثناء الرسائل الأكاديمية المهمة.
-- تنسيق الإرسال بـ HTML مع روابط قابلة للنقر للمستخدم والرسالة.
+- قاعدة بيانات SQLite واحدة مشتركة بين كل الجلسات.
+- كل ثريد (جلسة) يستخدم اتصال مستقل بالقاعدة لتفادي "Recursive use of cursors not allowed".
+- حذف تلقائي لقاعدة البيانات إذا تجاوز عمرها 24 ساعة (تُعاد إنشاؤها).
+- فلاتر ذكية: طول الرسالة، عدد الأسطر، تجاهل المشرفين، كلمات مفتاحية،
+  منع تكرار لكل مستخدم وتكرار عالمي للإعلانات، مع استثناء الطلبات الأكاديمية المهمة.
+- إرسال بتنيسق HTML وروابط قابلة للنقر.
+- مُهيأ للعمل على Render (أو أي استضافة) حتى لو شُغّل من داخل خيط (Thread) عبر Flask.
 
-قبل التشغيل:
-    pip install telethon requests
+ملاحظة:
+- تأكد من وجود sessions.json في جذر المشروع ويحتوي StringSession(s).
+- يمكن تعديل ALLOWED_RECIPIENTS لإرسال التنبيهات لمستخدمين محددين.
 """
 
 import os
@@ -37,8 +40,8 @@ API_ID = 27365071
 API_HASH = '4ab2f70c153a54c1738ba2e81e9ea822'
 BOT_TOKEN = "7991348516:AAG2-wBullJmGz4h1Ob2ii5djb8bQFLjm4w"
 
-# إرسال التنبيهات فقط لهؤلاء المستخدمين (ضع IDs المسموح لهم هنا)
-ALLOWED_RECIPIENTS = [698815776, 7052552394]  # مثال: [698815776, 123456789]
+# IDs المستلمين المسموح لهم بالتنبيه
+ALLOWED_RECIPIENTS = [698815776, 7052552394]
 
 SESS_FILE = "sessions.json"
 DB_PATH = "seen.db"
@@ -103,6 +106,14 @@ AD_HINT_KEYWORDS = [
     "رقمي", "رقم", "راسل", "ادخل", "انضم", "قناتي", "قناة", "رابط", "link", "contact"
 ]
 
+# ===== ضمان وجود Event Loop عند التشغيل من خيط خارجي (مثل app.py) =====
+def _ensure_loop():
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
 # ===== تحميل / حفظ الجلسات =====
 def load_sessions() -> List[str]:
     if not os.path.exists(SESS_FILE):
@@ -126,8 +137,10 @@ def save_sessions_list(sessions):
 
 def validate_sessions(api_id, api_hash, sessions):
     """استبعاد الجلسات التالفة مسبقًا لضمان عدم الانهيار."""
+    _ensure_loop()  # مهم عند التشغيل داخل خيط خارجي
     valid, invalid = [], []
-    for s in sessions:
+    print("🔎 [Sessions] التحقق من صلاحية الجلسات...")
+    for i, s in enumerate(sessions, 1):
         try:
             c = TelegramClient(StringSession(s), api_id, api_hash)
             c.connect()
@@ -135,11 +148,13 @@ def validate_sessions(api_id, api_hash, sessions):
             c.disconnect()
             valid.append(s)
         except AuthKeyUnregisteredError:
+            print(f"  ⛔ جلسة #{i} غير مسجلة (AuthKeyUnregisteredError).")
             invalid.append(s)
-        except Exception:
+        except Exception as e:
+            print(f"  ⛔ جلسة #{i} خطأ: {e}")
             invalid.append(s)
     if invalid:
-        print(f"⚠️ جلسات غير صالحة: {len(invalid)} — سيتم حذفها من {SESS_FILE}")
+        print(f"⚠️ [Sessions] جلسات غير صالحة: {len(invalid)} — سيتم حذفها من {SESS_FILE}")
         new_list = [s for s in sessions if s in valid]
         save_sessions_list(new_list)
     return valid
@@ -172,6 +187,7 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+    print("🗄️ [DB] قاعدة البيانات جاهزة.")
 
 # استدعِه مرة عند بدء البرنامج لضمان وجود الجداول
 init_db()
@@ -330,7 +346,7 @@ def get_message_handler(db_conn):
             # طبّع مرة واحدة واستخدمه في كل الفحوص
             text_norm = normalize_ar(text_raw)
 
-            # فحص الكلمات المفتاحية (OR) — لو ما في تطابق، نخرج بسرعة
+            # فحص الكلمات المفتاحية (OR)
             if not KEYWORDS_RE.search(text_norm):
                 return
 
@@ -354,17 +370,17 @@ def get_message_handler(db_conn):
             sender_id = getattr(sender, 'id', 0)
 
             # منطق التكرار:
-            # 1) الأكاديمي المهم → لا نطبق أي تكرار (نطبع دائمًا)
-            # 2) غير الأكاديمي:
-            #    - نمنع إعادة نفس النص من نفس المرسل خلال النافذة
-            #    - إذا كان إعلاني ad_like → نطبق تكرار عالمي (حتى من مستخدمين مختلفين)
+            # الأكاديمي المهم → يُطبع دائمًا
+            # غير الأكاديمي:
+            #   - امنع تكرار نفس النص من نفس المرسل
+            #   - لو إعلان → امنع التكرار عالميًا
             if not academic:
                 if is_duplicate_for_user(db_conn, sender_id, text_norm, now_ts):
                     return
                 if ad_like and is_duplicate_global(db_conn, text_norm, now_ts):
                     return
 
-            # تجهيز الروابط والمخرجات — مع HTML
+            # تجهيز الروابط — مع HTML
             if getattr(sender, "username", None):
                 sender_link = f"https://t.me/{sender.username}"
                 sender_label = f'@{sender.username}'
@@ -377,7 +393,6 @@ def get_message_handler(db_conn):
             if getattr(chat, "username", None):
                 msg_link = f"https://t.me/{chat.username}/{msg_id}"
 
-            # نهرب النص لتفادي مشاكل HTML
             safe_text = html.escape(text_raw)
 
             message_text = (
@@ -398,17 +413,14 @@ def get_message_handler(db_conn):
 def client_runner(session_str: str, idx: int):
     name = f"client-{idx}"
     backoff = 2
-    # اتصال DB خاص بهذا الثريد
-    db_conn = get_db_connection()
+    db_conn = get_db_connection()  # اتصال DB خاص بهذا الثريد
     while True:
         try:
-            # إنشاء loop لهذا الخيط (ضروري لتليثون داخل الخيوط)
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
             client = TelegramClient(StringSession(session_str), API_ID, API_HASH)
             client.start()
-            # إضافة المعالج المرتبط باتصال هذا الثريد
             client.add_event_handler(get_message_handler(db_conn), events.NewMessage())
             print(f"✅ [{name}] جاهز — يبدأ الاستماع")
             send_alert_http(f"<b>✅ [{name}] متصل — بدأ الاستماع للرسائل.</b>")
@@ -426,10 +438,16 @@ def client_runner(session_str: str, idx: int):
 
 # ===== التشغيل =====
 def main():
+    _ensure_loop()  # مهم جدًا عند التشغيل من خيط خارجي (app.py)
+    print("🚀 بدء تشغيل البوت...")
+    print(f"📤 [Recipients] IDs المسموح لها: {ALLOWED_RECIPIENTS}")
+
     sessions = load_sessions()
+    print(f"📦 [Sessions] تم تحميل {len(sessions)} جلسة.")
     if not sessions:
-        print("❌ لا توجد جلسات — شغّل session_manager.py أولًا.")
+        print("❌ لا توجد جلسات — شغّل sessions tel.py لإضافة جلسات ثم ارفع sessions.json.")
         return
+
     sessions = validate_sessions(API_ID, API_HASH, sessions)
     if not sessions:
         print("❌ كل الجلسات غير صالحة — أنشئ جلسات جديدة.")
@@ -443,7 +461,7 @@ def main():
 
     threads = []
     for i, s in enumerate(sessions, 1):
-        t = threading.Thread(target=client_runner, args=(s, i), daemon=True)
+        t = threading.Thread(target=client_runner, args=(s, i), daemon=True, name=f"tg-client-{i}")
         t.start()
         threads.append(t)
         print(f"✅ تشغيل جلسة #{i}")
