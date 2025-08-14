@@ -447,10 +447,14 @@ def main():
     if not sessions:
         print("❌ لا توجد جلسات — شغّل sessions tel.py لإضافة جلسات ثم ارفع sessions.json.")
         return
-
+if VALIDATE_BEFORE_START:
     sessions = validate_sessions(API_ID, API_HASH, sessions)
     if not sessions:
         print("❌ كل الجلسات غير صالحة — أنشئ جلسات جديدة.")
+        return
+else:
+    print("⚠️ تخطّي فحص الجلسات المسبق — سيتم تشغيلها مباشرة.")
+    
         return
 
     send_alert_http(
